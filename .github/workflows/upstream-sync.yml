@@ -1,0 +1,326 @@
+name: Upstream Sync
+
+# Keeps this fork in step with railspulse/rails_pulse, once a day.
+#
+# - main mirrors the upstream's main, which pull requests back to it are based on.
+# - New upstream commits are merged into remote-mode on sync/upstream (rewritten
+#   on every run), the test suite runs on the merge (SQLite and the central, as
+#   in the Test Suite workflow), and a pull request from sync/upstream into
+#   remote-mode is opened or updated with the new commits and the result.
+#   Merge it with a merge commit: a squash would leave remote-mode without the
+#   upstream commits, and every later run would find them new again.
+# - A merge that conflicts is aborted, and an issue labelled upstream-sync is
+#   opened or updated with the conflicted files and the commands to merge by hand.
+#
+# A pull request opened with the GITHUB_TOKEN does not trigger other workflows,
+# so the suite runs in this job, and the Test Suite (the full database and
+# Rails matrix) is dispatched on sync/upstream, which workflow_dispatch allows.
+#
+# GitHub refuses a push from the GITHUB_TOKEN that changes a file under
+# .github/workflows, so when the upstream changes one the push fails and the
+# run says so, with the commands to push by hand. A token with the workflow
+# scope in the UPSTREAM_SYNC_TOKEN secret, when set, is used to push instead.
+#
+# Runs on GitHub's hosted ubuntu-latest: this fork is public, hosted runners are
+# free for public repositories, and the organisation's own runners
+# (org-runners-gcp-small) must not run code from a public repository.
+#
+# Run it by hand with a rehearse_ref (an upstream branch remote-mode does not
+# contain) to try the merge, the suite and the pull request or issue it would
+# write, without pushing anything or opening either.
+
+on:
+  schedule:
+    - cron: "0 9 * * *" # 09:00 UTC, 06:00 in Brasília
+  workflow_dispatch:
+    inputs:
+      rehearse_ref:
+        description: "Rehearsal: an upstream branch to merge instead of main. Merges and tests, and only reports the pull request or issue it would write."
+        required: false
+        default: ""
+
+permissions:
+  contents: write # mirror main, push sync/upstream
+  pull-requests: write # open or update the sync pull request
+  issues: write # open, update or close the conflict issue
+  actions: write # dispatch the Test Suite on sync/upstream
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPOSITORY: railspulse/rails_pulse
+      BASE_BRANCH: remote-mode
+      SYNC_BRANCH: sync/upstream
+      LABEL: upstream-sync
+      REHEARSE_REF: ${{ inputs.rehearse_ref || '' }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        ref: remote-mode
+        fetch-depth: 0
+        token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+    - name: Fetch upstream
+      id: upstream
+      run: |
+        ref="${REHEARSE_REF:-main}"
+        git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+        git fetch --no-tags upstream "+refs/heads/${ref}:refs/remotes/upstream/${ref}"
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        sha=$(git rev-parse "upstream/${ref}")
+        {
+          echo "ref=${ref}"
+          echo "sha=${sha}"
+          echo "short=$(git rev-parse --short "${sha}")"
+        } >> "$GITHUB_OUTPUT"
+        if [ -n "$REHEARSE_REF" ]; then
+          echo "## Rehearsal with upstream ${ref} ($(git rev-parse --short "${sha}"))" >> "$GITHUB_STEP_SUMMARY"
+          echo "Nothing is pushed, and no pull request or issue is opened." >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    # Fast-forward only: a main that has diverged from the upstream's is
+    # reported, never overwritten.
+    - name: Mirror upstream main to this fork's main
+      id: mirror
+      if: env.REHEARSE_REF == ''
+      continue-on-error: true
+      run: |
+        if git push origin "refs/remotes/upstream/main:refs/heads/main"; then
+          echo "main mirrors upstream main ($(git rev-parse --short upstream/main))." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        {
+          echo "### main could not be fast-forwarded to upstream main"
+          echo "Either it has diverged, or the new commits change .github/workflows, which the GITHUB_TOKEN may not push. From a clone:"
+          echo '```bash'
+          echo "git fetch https://github.com/${UPSTREAM_REPOSITORY}.git main"
+          echo "git push git@github.com:${GITHUB_REPOSITORY}.git FETCH_HEAD:refs/heads/main"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+        exit 1
+
+    - name: Look for upstream commits remote-mode does not have
+      id: check
+      env:
+        REF: ${{ steps.upstream.outputs.ref }}
+      run: |
+        if git merge-base --is-ancestor "upstream/${REF}" HEAD; then
+          echo "news=false" >> "$GITHUB_OUTPUT"
+          echo "Sem novidade: ${BASE_BRANCH} already contains upstream ${REF} ($(git rev-parse --short "upstream/${REF}"))." >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        echo "news=true" >> "$GITHUB_OUTPUT"
+        # At most 200 lines, so a long gap still fits a pull request body.
+        count=$(git rev-list --no-merges --count "HEAD..upstream/${REF}")
+        git log --no-merges --max-count=200 --format='- [`%h`](https://github.com/'"${UPSTREAM_REPOSITORY}"'/commit/%H) %s (%an, %as)' "HEAD..upstream/${REF}" > "$RUNNER_TEMP/commits.md"
+        [ "$count" -le 200 ] || echo "- …and $((count - 200)) older commits" >> "$RUNNER_TEMP/commits.md"
+        {
+          echo "### New upstream commits"
+          cat "$RUNNER_TEMP/commits.md"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Merge into sync/upstream
+      id: merge
+      if: steps.check.outputs.news == 'true'
+      env:
+        REF: ${{ steps.upstream.outputs.ref }}
+        SHORT: ${{ steps.upstream.outputs.short }}
+      run: |
+        git checkout -B "$SYNC_BRANCH" HEAD
+        if git merge --no-ff --no-edit -m "Merge upstream ${REF} (${SHORT}) into ${BASE_BRANCH}" "upstream/${REF}"; then
+          echo "conflict=false" >> "$GITHUB_OUTPUT"
+        else
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+          git merge --abort
+          echo "conflict=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set up Ruby
+      if: steps.merge.outputs.conflict == 'false'
+      uses: ruby/setup-ruby@v1
+      with:
+        ruby-version: "3.4"
+        bundler-cache: false
+
+    # As one cell of the Test Suite: SQLite on Rails 8.1, the main suite, the
+    # migration regression and the central suite (rake test runs all three).
+    - name: Run the test suite on the merge
+      id: suite
+      if: steps.merge.outputs.conflict == 'false'
+      env:
+        RAILS_ENV: test
+        CI: true
+        DB: sqlite3
+        BUNDLE_GEMFILE: gemfiles/rails_8_1.gemfile
+      run: |
+        set -o pipefail
+        status=0
+        {
+          bundle install &&
+            bundle exec rake "test_setup_for_version[sqlite3,rails-8-1]" &&
+            bundle exec appraisal rails-8-1 rake test
+        } 2>&1 | tee "$RUNNER_TEMP/suite.log" || status=$?
+        sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/suite.log" | grep -E '^\s*(\[ok\]|\[!!\]|== (PASS|FAIL))' | tail -n 8 > "$RUNNER_TEMP/suite-summary.txt" || true
+        if [ "$status" -eq 0 ]; then
+          echo "result=passed" >> "$GITHUB_OUTPUT"
+        else
+          echo "result=failed" >> "$GITHUB_OUTPUT"
+        fi
+        {
+          echo "### Test suite on the merge: $([ "$status" -eq 0 ] && echo passed || echo failed)"
+          echo '```'
+          cat "$RUNNER_TEMP/suite-summary.txt"
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Write the pull request
+      if: steps.merge.outputs.conflict == 'false'
+      env:
+        REF: ${{ steps.upstream.outputs.ref }}
+        SHA: ${{ steps.upstream.outputs.sha }}
+        RESULT: ${{ steps.suite.outputs.result }}
+      run: |
+        {
+          echo "Merges upstream \`${REF}\` (${UPSTREAM_REPOSITORY}@${SHA}) into \`${BASE_BRANCH}\`."
+          echo
+          echo "## New upstream commits"
+          echo
+          cat "$RUNNER_TEMP/commits.md"
+          echo
+          echo "## Test suite on the merge: ${RESULT}"
+          echo
+          echo "SQLite on Rails 8.1: the main suite, the migration regression and the central suite ([run](${RUN_URL}))."
+          echo
+          echo '```'
+          cat "$RUNNER_TEMP/suite-summary.txt"
+          echo '```'
+          echo
+          echo "The full Test Suite (every database and Rails version) is dispatched on \`${SYNC_BRANCH}\`; see its run in Actions."
+          echo
+          echo "Merge with **Create a merge commit**: a squash would leave \`${BASE_BRANCH}\` without the upstream commits, and the next sync would find them new again."
+        } > "$RUNNER_TEMP/pr-body.md"
+        if [ -n "$REHEARSE_REF" ]; then
+          {
+            echo "### Rehearsal: the pull request it would open or update (${SYNC_BRANCH} → ${BASE_BRANCH})"
+            cat "$RUNNER_TEMP/pr-body.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Open or update the pull request
+      id: pull_request
+      if: steps.merge.outputs.conflict == 'false' && env.REHEARSE_REF == ''
+      env:
+        REF: ${{ steps.upstream.outputs.ref }}
+        SHORT: ${{ steps.upstream.outputs.short }}
+      run: |
+        if ! git push --force origin "${SYNC_BRANCH}"; then
+          echo "push_refused=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        title="Merge upstream ${REF} (${SHORT}) into ${BASE_BRANCH}"
+        number=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$SYNC_BRANCH" --base "$BASE_BRANCH" --state open --json number --jq '.[0].number // empty')
+        if [ -n "$number" ]; then
+          gh pr edit "$number" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+        else
+          gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --head "$SYNC_BRANCH" --title "$title" --body-file "$RUNNER_TEMP/pr-body.md"
+        fi
+        gh workflow run test.yml --repo "$GITHUB_REPOSITORY" --ref "$SYNC_BRANCH"
+        echo "Pull request: $(gh pr view "$SYNC_BRANCH" --repo "$GITHUB_REPOSITORY" --json url --jq .url)" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Write the issue
+      if: steps.merge.outputs.conflict == 'true' || steps.pull_request.outputs.push_refused == 'true'
+      env:
+        REF: ${{ steps.upstream.outputs.ref }}
+        SHA: ${{ steps.upstream.outputs.sha }}
+        CONFLICT: ${{ steps.merge.outputs.conflict }}
+      run: |
+        {
+          if [ "$CONFLICT" = "true" ]; then
+            echo "Merging upstream \`${REF}\` (${UPSTREAM_REPOSITORY}@${SHA}) into \`${BASE_BRANCH}\` conflicts, so the daily sync ([run](${RUN_URL})) stopped."
+            echo
+            echo "## Files in conflict"
+            echo
+            sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/conflicts.txt"
+          else
+            echo "Upstream \`${REF}\` (${UPSTREAM_REPOSITORY}@${SHA}) merges into \`${BASE_BRANCH}\` cleanly, but GitHub refused to let the sync ([run](${RUN_URL})) push \`${SYNC_BRANCH}\`: the new commits change .github/workflows, which the GITHUB_TOKEN may not push. Push it by hand, or set the UPSTREAM_SYNC_TOKEN secret to a token with the workflow scope."
+          fi
+          echo
+          echo "## New upstream commits"
+          echo
+          cat "$RUNNER_TEMP/commits.md"
+          echo
+          echo "## To merge by hand"
+          echo
+          echo '```bash'
+          echo "git fetch https://github.com/${UPSTREAM_REPOSITORY}.git ${REF}"
+          echo "git checkout -B ${SYNC_BRANCH} origin/${BASE_BRANCH}"
+          echo "git merge --no-ff FETCH_HEAD   # resolve any conflict, then git commit"
+          echo "bundle exec rake test           # with the central suite, as CI runs it"
+          echo "git push --force origin ${SYNC_BRANCH}"
+          echo "gh pr create --base ${BASE_BRANCH} --head ${SYNC_BRANCH} --fill"
+          echo '```'
+          echo
+          echo "This issue closes itself on the first sync that merges cleanly."
+        } > "$RUNNER_TEMP/issue-body.md"
+        if [ -n "$REHEARSE_REF" ]; then
+          {
+            echo "### Rehearsal: the issue it would open or update"
+            cat "$RUNNER_TEMP/issue-body.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Open or update the issue
+      id: issue
+      if: (steps.merge.outputs.conflict == 'true' || steps.pull_request.outputs.push_refused == 'true') && env.REHEARSE_REF == ''
+      env:
+        REF: ${{ steps.upstream.outputs.ref }}
+        SHORT: ${{ steps.upstream.outputs.short }}
+        CONFLICT: ${{ steps.merge.outputs.conflict }}
+      run: |
+        if [ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq .has_issues)" != "true" ]; then
+          echo "::error::Issues are disabled on ${GITHUB_REPOSITORY}; the conflict is described in this run's summary. Enable them with: gh repo edit ${GITHUB_REPOSITORY} --enable-issues"
+          cat "$RUNNER_TEMP/issue-body.md" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
+        fi
+        gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color D93F0B --description "Merging the upstream into remote-mode needs a hand" --force
+        if [ "$CONFLICT" = "true" ]; then
+          title="Upstream sync: merging ${REF} (${SHORT}) conflicts"
+        else
+          title="Upstream sync: ${REF} (${SHORT}) changes workflows; push it by hand"
+        fi
+        number=$(gh issue list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state open --json number --jq '.[0].number // empty')
+        if [ -n "$number" ]; then
+          gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$RUNNER_TEMP/issue-body.md"
+        else
+          gh issue create --repo "$GITHUB_REPOSITORY" --label "$LABEL" --title "$title" --body-file "$RUNNER_TEMP/issue-body.md"
+        fi
+
+    # Nothing new, or a clean merge that was pushed: an open issue is resolved.
+    - name: Close a resolved issue
+      if: env.REHEARSE_REF == '' && steps.merge.outputs.conflict != 'true' && steps.pull_request.outputs.push_refused != 'true'
+      run: |
+        [ "$(gh api "repos/${GITHUB_REPOSITORY}" --jq .has_issues)" = "true" ] || exit 0
+        gh issue list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state open --json number --jq '.[].number' |
+          while read -r number; do
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY" --comment "Resolved: the sync ([run](${RUN_URL})) found nothing in conflict."
+          done
+
+    - name: Fail the run when something needs a hand
+      if: steps.mirror.outcome == 'failure' || steps.merge.outputs.conflict == 'true' || steps.suite.outputs.result == 'failed' || steps.pull_request.outputs.push_refused == 'true'
+      run: |
+        [ "${{ steps.mirror.outcome }}" != "failure" ] || echo "::error::main could not be fast-forwarded to upstream main."
+        [ "${{ steps.merge.outputs.conflict }}" != "true" ] || echo "::error::Merging upstream into ${BASE_BRANCH} conflicts."
+        [ "${{ steps.suite.outputs.result }}" != "failed" ] || echo "::error::The test suite fails on the merge."
+        [ "${{ steps.pull_request.outputs.push_refused }}" != "true" ] || echo "::error::GitHub refused the push of ${SYNC_BRANCH}."
+        exit 1
