@@ -13,7 +13,7 @@ elsif preference.is_a?(String) && preset_labels.key?(preference.to_sym)
   current_selection = preference.to_sym
   current_label = preset_labels[current_selection]
 else
-  current_selection = default_time_range_key.to_sym
+  current_selection = RailsPulse::TimeRange.opening_key(default_time_range_key).to_sym
   current_label = preset_labels.fetch(current_selection, preset_labels[:last_24_hours])
 end %>
 

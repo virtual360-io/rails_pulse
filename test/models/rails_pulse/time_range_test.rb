@@ -55,6 +55,40 @@ class RailsPulse::TimeRangeTest < ActiveSupport::TestCase
     assert_equal "last_7_days", result.selected_time_range
   end
 
+  test "config.default_time_range replaces the page's default_key" do
+    with_configuration(default_time_range: :last_24_hours) do
+      result = resolve(default_key: :last_14_days)
+
+      assert_equal "last_24_hours", result.selected_time_range
+      assert_equal "hour", result.period_type
+      assert_in_delta 23.hours.ago.beginning_of_hour.to_i, result.window.start_time.to_i, 10
+    end
+  end
+
+  test "opening_key is the page default unless config.default_time_range is set" do
+    assert_equal :last_14_days, RailsPulse::TimeRange.opening_key(:last_14_days)
+
+    with_configuration(default_time_range: :last_30_days) do
+      assert_equal :last_30_days, RailsPulse::TimeRange.opening_key(:last_14_days)
+    end
+  end
+
+  test "a preset from the dropdown still wins over config.default_time_range" do
+    with_configuration(default_time_range: :last_24_hours) do
+      result = resolve(q: { period_start_range: "last_7_days" }, default_key: :last_14_days)
+
+      assert_equal "last_7_days", result.selected_time_range
+    end
+  end
+
+  test "a session preference still wins over config.default_time_range" do
+    with_configuration(default_time_range: :last_24_hours) do
+      result = resolve(session: { time_range_preference: "last_30_days" }, default_key: :last_14_days)
+
+      assert_equal "last_30_days", result.selected_time_range
+    end
+  end
+
   # Priority 1: Page-Specific Preset Tests
 
   test "page-specific preset from dropdown wins" do

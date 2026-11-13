@@ -33,6 +33,15 @@ class RailsPulse::TimeRangeSelectorTest < ActionView::TestCase
     assert_select "button.menu__item--active[data-preset=last_24_hours]"
   end
 
+  test "renders config.default_time_range instead of the page default" do
+    with_configuration(default_time_range: :last_30_days) do
+      render_selector(nil, default_key: :last_7_days)
+    end
+
+    assert_select "[data-rails-pulse--time-range-target=label]", text: "Last 30 days"
+    assert_select "button.menu__item--active[data-preset=last_30_days]"
+  end
+
   test "renders a page default other than the base default" do
     render_selector(nil, default_key: :last_7_days)
 

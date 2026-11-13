@@ -552,4 +552,13 @@ RailsPulse.configure do |config|
   # there is always a way back from Rails Pulse to the host application.
   # Set to nil to hide the link. The standalone dashboard never shows it.
   # config.return_to_app_url = "/"
+
+  # The time range every dashboard page opens on until the time range
+  # selector picks another: :last_24_hours, :last_7_days, :last_14_days or
+  # :last_30_days. nil keeps each page's own default: the dashboard and the
+  # requests open on the last 24 hours, queries, jobs and exceptions on 7
+  # days, and routes on 14. Ranges longer than 25 hours read the daily
+  # summaries, which exist only for days that have ended, so a fresh install
+  # shows them empty until its first day ends.
+  # config.default_time_range = nil
 end
