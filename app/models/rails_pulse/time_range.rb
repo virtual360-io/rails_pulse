@@ -11,7 +11,7 @@ module RailsPulse
   #   3. Chart zoom / drill-down params (params[:q][:occurred_at_gteq/_lt])
   #   4. Time range selector preference (session[:time_range_preference])
   #   5. Global filters (session[:global_filters]["start_time"/"end_time"])
-  #   6. Default (default_key)
+  #   6. Default: config.default_time_range when set, else the page's default_key
   #
   # Every input is parsed in Time.zone, matching how Summary rows are
   # bucketed — parsing a custom-range string in any other zone would
@@ -79,6 +79,14 @@ module RailsPulse
     end
     private_class_method :utc_zone?
 
+    # The preset a page opens on when neither the URL nor the session picks
+    # one: config.default_time_range for every page when the host sets it,
+    # otherwise the page's own default. The header's selector names its
+    # label with it too, so the label and the page agree.
+    def self.opening_key(page_default)
+      RailsPulse.configuration.default_time_range || page_default
+    end
+
     def self.resolve(params:, session:, default_key: :last_24_hours, duration_range_type: :route)
       new(params: params, session: session, default_key: default_key, duration_range_type: duration_range_type).resolve
     end
@@ -124,7 +132,8 @@ module RailsPulse
     end
 
     def default_window
-      [ preset_start(default_key), Time.zone.now, default_key ]
+      key = self.class.opening_key(default_key)
+      [ preset_start(key), Time.zone.now, key ]
     end
 
     def preset_start(key)

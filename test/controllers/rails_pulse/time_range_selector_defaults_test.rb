@@ -67,7 +67,30 @@ class RailsPulse::TimeRangeSelectorDefaultsTest < ActionDispatch::IntegrationTes
     assert_select LABEL, text: "Last 7 days"
   end
 
+  test "config.default_time_range opens every page on that range and names it" do
+    with_configuration(default_time_range: :last_24_hours) do
+      { rails_pulse.routes_path => true, rails_pulse.queries_path => true, rails_pulse.jobs_path => true,
+        rails_pulse.exceptions_path => false }.each do |path, assigns_time_range|
+        get path
+
+        assert_response :success
+        assert_select LABEL, text: "Last 24 hours"
+        assert_equal "last_24_hours", assigns(:time_range).selected_time_range if assigns_time_range
+      end
+    end
+  end
+
   # Edge Cases
+
+  test "a stored preference is shown instead of config.default_time_range" do
+    with_configuration(default_time_range: :last_24_hours) do
+      patch rails_pulse.settings_time_range_path, params: { preset: "last_30_days" }
+      get rails_pulse.routes_path
+
+      assert_response :success
+      assert_select LABEL, text: "Last 30 days"
+    end
+  end
 
   test "a stored preference is shown instead of the page default" do
     patch rails_pulse.settings_time_range_path, params: { preset: "last_30_days" }

@@ -278,6 +278,7 @@ module RailsPulse
                   :capture_job_arguments,
                   :mount_dashboard,
                   :return_to_app_url,
+                  :default_time_range,
                   :logger,
                   :async,
                   :async_queue_size,
@@ -342,6 +343,11 @@ module RailsPulse
 
     STORE_FULL_DETAILS_KEYS = %i[above_threshold sample_rate_below].freeze
     DEFAULT_FULL_DETAILS_SAMPLE_RATE = 0.01
+
+    # The time range selector's presets (RailsPulse::TimeRange::PRESET_START),
+    # the values default_time_range accepts. Listed here because the
+    # configuration is validated while the host boots, before app/ autoloads.
+    TIME_RANGE_PRESETS = %i[last_24_hours last_7_days last_14_days last_30_days].freeze
 
     # Resolved on assignment, and again whenever a threshold changes, so the
     # settings are ready the moment the initializer line runs, whichever
@@ -429,6 +435,8 @@ module RailsPulse
       # Dashboard settings
       @mount_dashboard = true
       @return_to_app_url = "/"
+      # nil: each page opens on its own default range (its default_time_range_key).
+      @default_time_range = nil
       @logger = nil
 
       # Tracking mode settings. With async, one writer thread per process
@@ -803,6 +811,10 @@ module RailsPulse
 
       unless @return_to_app_url.nil? || (@return_to_app_url.is_a?(String) && @return_to_app_url.present?)
         raise ArgumentError, "return_to_app_url must be a non-empty string or nil, got #{@return_to_app_url.inspect}"
+      end
+
+      unless @default_time_range.nil? || TIME_RANGE_PRESETS.include?(@default_time_range)
+        raise ArgumentError, "default_time_range must be nil or one of #{TIME_RANGE_PRESETS.map(&:inspect).join(", ")}, got #{@default_time_range.inspect}"
       end
     end
 

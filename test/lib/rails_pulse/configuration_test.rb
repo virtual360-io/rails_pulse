@@ -257,6 +257,24 @@ module RailsPulse
       assert_raises(ArgumentError) { build_config { @return_to_app_url = :root } }
     end
 
+    test "default_time_range defaults to nil and accepts each preset of the time range selector" do
+      assert_nil Configuration.new.default_time_range
+
+      Configuration::TIME_RANGE_PRESETS.each do |preset|
+        assert_equal preset, build_config { @default_time_range = preset }.default_time_range
+      end
+    end
+
+    test "default_time_range lists exactly the presets RailsPulse::TimeRange resolves" do
+      assert_equal RailsPulse::TimeRange::PRESET_START.keys.map(&:to_sym), Configuration::TIME_RANGE_PRESETS
+    end
+
+    test "default_time_range rejects a string, an unknown preset and custom" do
+      assert_raises(ArgumentError) { build_config { @default_time_range = "last_24_hours" } }
+      assert_raises(ArgumentError) { build_config { @default_time_range = :last_90_days } }
+      assert_raises(ArgumentError) { build_config { @default_time_range = :custom } }
+    end
+
     test "route_thresholds has slow very_slow and critical keys" do
       config = Configuration.new
 
