@@ -231,7 +231,10 @@ Each is an `ActiveJob`; enqueue it the same way as any other job in the host app
   `config.archiving_enabled`; returns the stats hash from `CleanupService`, or `nil` if
   archiving is disabled. Each run is recorded as a `cleanup_run` event, which is how
   `rails_pulse:status` and the dashboard's storage-pressure signals tell whether cleanup
-  is scheduled.
+  is scheduled. A run whose only failures were stages that gave up waiting for a database
+  lock enqueues itself again `CleanupJob::FOLLOW_UP_DELAY` later, for that application
+  only, up to `CleanupJob::FOLLOW_UP_LIMIT` times; the keywords it passes (`application:`,
+  `after_run_id:`, `follow_up:`) are internal, and a host schedules the job without them.
 - `RailsPulse::BackfillSummariesJob.perform_later(start_date, end_date, period_types = ["hour", "day"])`
   — backfills summaries for an existing date range.
 - `RailsPulse::CloudSyncJob` — queues newly summarized hours, changed exception groups and

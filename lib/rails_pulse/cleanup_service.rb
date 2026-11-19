@@ -8,6 +8,53 @@ module RailsPulse
     # parent ids are held in Ruby and sent back as a list, so this bounds it.
     PARENT_BATCH_SIZE = 1_000
 
+    # The smallest DELETE a stage shrinks to under contention. Below this the
+    # per-statement overhead dominates and a stage over a large backlog would
+    # not finish within a run.
+    MIN_BATCH_SIZE = 500
+
+    # A batch that holds the write lock longer than this halves the batches
+    # after it. SQLite has one writer at a time, and ingestion and the summary
+    # job wait on the same lock with a busy timeout of a few seconds.
+    BATCH_LOCK_TARGET = 1.0
+
+    # Between batches on SQLite the cleanup gives up the lock for this long.
+    # SQLite's busy handler is not fair: a writer that commits and starts its
+    # next statement at once wins the lock again over one that is polling, so
+    # without a pause ingestion can wait out its whole busy timeout.
+    SQLITE_BATCH_PAUSE = 0.05
+
+    # Errors that mean the statement could not take its lock in time and
+    # changed nothing: SQLite's "database is locked" (StatementTimeout), a
+    # lock wait timeout, a deadlock. Each statement runs on its own, so it can
+    # be sent again and picks its rows again inside the database, starting
+    # from what earlier batches already removed.
+    LOCK_ERRORS = [
+      ActiveRecord::StatementTimeout,
+      ActiveRecord::LockWaitTimeout,
+      ActiveRecord::Deadlocked
+    ].freeze
+
+    # Matches LOCK_ERRORS in a rescue clause, and also SQLite's "database is
+    # locked" where Active Record before 8.0 reports it as a plain
+    # StatementInvalid whose cause is the SQLite3::BusyException.
+    module LockError
+      def self.===(error)
+        LOCK_ERRORS.any? { |klass| error.is_a?(klass) } || sqlite_busy?(error)
+      end
+
+      def self.sqlite_busy?(error)
+        defined?(::SQLite3::BusyException) &&
+          error.is_a?(ActiveRecord::StatementInvalid) &&
+          error.cause.is_a?(::SQLite3::BusyException)
+      end
+    end
+
+    # Attempts per statement, and the wait before each retry. With SQLite's
+    # busy timeout on top, a statement gives up after a minute or so of
+    # contention, and the stage then fails with what it had removed so far.
+    LOCK_RETRY_DELAYS = [ 1, 2, 4, 8, 16 ].freeze
+
     def self.perform
       new.perform
     end
@@ -20,6 +67,8 @@ module RailsPulse
         total_deleted: 0
       }
       @failures = []
+      @stage_deleted = 0
+      @batch_size = BATCH_SIZE
     end
 
     def perform
@@ -45,28 +94,48 @@ module RailsPulse
     # held until every stage has run, so one table that cannot be cleaned does
     # not stop the others; each stage removes its own child rows or skips rows
     # that still have them, so none depends on an earlier stage succeeding.
+    #
+    # A stage that fails keeps the count of the rows its committed batches
+    # removed, so the run's record says how far it got.
     def run_stage(group, name)
+      @stage_deleted = 0
+      @batch_size = BATCH_SIZE
       @stats[group][name] = yield
     rescue StandardError => e
-      @stats[group][name] = 0
-      @failures << { stage: "#{name} (#{group})", error: e }
-      RailsPulse.logger.error "Cleanup stage #{name} (#{group}) failed: #{e.class}: #{e.message}"
+      @stats[group][name] = @stage_deleted
+      @failures << {
+        stage: "#{name} (#{group})",
+        error: e,
+        deleted: @stage_deleted,
+        lock_contention: lock_error?(e)
+      }
+      RailsPulse.logger.error "Cleanup stage #{name} (#{group})#{application_label} failed after deleting " \
+        "#{@stage_deleted} row(s): #{e.class}: #{e.message}"
     end
 
     # Deletes the relation's rows in statements of at most BATCH_SIZE rows,
     # choosing each batch inside the database. `order_column` decides which
-    # rows go first; `limit` stops after that many rows.
-    def delete_in_batches(relation, order_column: nil, limit: nil)
+    # rows go first; `limit` stops after that many rows. A stage's own rows
+    # count towards its progress; `progress: false` is for child rows a parent
+    # stage removes first.
+    def delete_in_batches(relation, order_column: nil, limit: nil, progress: true)
       relation = relation.order(order_column => :asc) if order_column
       deleted = 0
 
       loop do
-        batch_size = limit ? [ BATCH_SIZE, limit - deleted ].min : BATCH_SIZE
-        break if batch_size <= 0
+        break if limit && limit - deleted <= 0
 
-        count = relation.limit(batch_size).delete_all
+        # Sized on each attempt: a retry after a lock error sends a smaller batch.
+        batch_size = nil
+        count = timed_batch do
+          batch_size = limit ? [ @batch_size, limit - deleted ].min : @batch_size
+          relation.limit(batch_size).delete_all
+        end
         deleted += count
+        @stage_deleted += count if progress
         break if count < batch_size
+
+        pause_between_batches
       end
 
       deleted
@@ -82,15 +151,75 @@ module RailsPulse
         batch_size = limit ? [ PARENT_BATCH_SIZE, limit - deleted ].min : PARENT_BATCH_SIZE
         break if batch_size <= 0
 
-        ids = parents.order(order_column => :asc).limit(batch_size).pluck(:id)
+        ids = with_lock_retry { parents.order(order_column => :asc).limit(batch_size).pluck(:id) }
         break if ids.empty?
 
-        delete_in_batches(children.where(foreign_key => ids))
-        deleted += parents.where(id: ids).delete_all
+        delete_in_batches(children.where(foreign_key => ids), progress: false)
+        count = timed_batch { parents.where(id: ids).delete_all }
+        deleted += count
+        @stage_deleted += count
         break if ids.size < batch_size
+
+        pause_between_batches
       end
 
       deleted
+    end
+
+    # Runs one DELETE with lock retries, then shrinks the stage's batches if
+    # the attempt that succeeded held the lock too long.
+    def timed_batch
+      elapsed = 0
+      count = with_lock_retry do
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        yield.tap { elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started }
+      end
+      shrink_batches if elapsed > BATCH_LOCK_TARGET
+      count
+    end
+
+    # On SQLite, lets other writers take the lock before the next batch.
+    def pause_between_batches
+      sleep(SQLITE_BATCH_PAUSE) if SQLITE_BATCH_PAUSE.positive? && sqlite?
+    end
+
+    # Sends the statement again after a lock error, waiting longer each time
+    # and with smaller batches for the rest of the stage. The last error is
+    # raised once LOCK_RETRY_DELAYS is spent, so a lock that never frees still
+    # fails the stage.
+    def with_lock_retry
+      attempt = 0
+      begin
+        yield
+      rescue LockError => e
+        delay = LOCK_RETRY_DELAYS[attempt]
+        raise unless delay
+
+        attempt += 1
+        shrink_batches
+        RailsPulse.logger.warn "Cleanup#{application_label} could not take the lock (#{e.class}), " \
+          "retry #{attempt} of #{LOCK_RETRY_DELAYS.size} in #{delay}s with batches of #{@batch_size}"
+        sleep(delay)
+        retry
+      end
+    end
+
+    def shrink_batches
+      @batch_size = [ @batch_size / 2, [ MIN_BATCH_SIZE, BATCH_SIZE ].min ].max
+    end
+
+    def lock_error?(error)
+      LockError === error
+    end
+
+    def sqlite?
+      @sqlite = RailsPulse::DatabaseAdapter.sqlite?(RailsPulse::ApplicationRecord.connection) if @sqlite.nil?
+      @sqlite
+    end
+
+    def application_label
+      application = RailsPulse::Central.current_application
+      application ? " [#{application}]" : ""
     end
 
     def cleanup_enabled?
@@ -178,7 +307,7 @@ module RailsPulse
       return 0 unless max_records
 
       relation = scope || model_class
-      overage = relation.count - max_records
+      overage = with_lock_retry { relation.count } - max_records
       return 0 if overage <= 0
 
       delete_in_batches(relation, order_column: order_column, limit: overage)
@@ -263,7 +392,7 @@ module RailsPulse
       cutoff = summarized_cutoff
       return 0 unless cutoff
 
-      overage = RailsPulse::Request.count - max_records
+      overage = with_lock_retry { RailsPulse::Request.count } - max_records
       return 0 if overage <= 0
 
       delete_parents_in_batches(
@@ -279,7 +408,7 @@ module RailsPulse
       max_records = @config.max_table_records[:rails_pulse_job_runs]
       return 0 unless max_records
 
-      overage = RailsPulse::JobRun.count - max_records
+      overage = with_lock_retry { RailsPulse::JobRun.count } - max_records
       return 0 if overage <= 0
 
       delete_parents_in_batches(
@@ -376,7 +505,7 @@ module RailsPulse
       return 0 unless max_records
 
       scope = RailsPulse::ExceptionGroup.where(preserve: false).where.not(status: "ignored")
-      overage = scope.count - max_records
+      overage = with_lock_retry { scope.count } - max_records
       return 0 if overage <= 0
 
       delete_parents_in_batches(
@@ -421,7 +550,20 @@ module RailsPulse
     def record_run
       return unless RailsPulse::Event.table_available?
 
-      RailsPulse::CleanupRun.record!(stats: @stats, failed_stages: @failures.map { |failure| failure[:stage] })
+      RailsPulse::CleanupRun.record!(
+        stats: @stats,
+        failed_stages: @failures.map { |failure| failure[:stage] },
+        failures: @failures.map do |failure|
+          {
+            stage: failure[:stage],
+            error: failure[:error].class.name,
+            message: failure[:error].message.to_s.truncate(500),
+            deleted: failure[:deleted],
+            lock_contention: failure[:lock_contention]
+          }
+        end,
+        application: RailsPulse::Central.current_application
+      )
     rescue StandardError => e
       RailsPulse.logger.error "Could not record the cleanup run: #{e.class}: #{e.message}"
     end
@@ -441,7 +583,7 @@ module RailsPulse
       @stats[:total_deleted] = total_time_based + total_count_based
 
       if @failures.any?
-        RailsPulse.logger.error "Cleanup finished with #{@failures.size} failed stage(s): #{@failures.map { |failure| failure[:stage] }.join(', ')}"
+        RailsPulse.logger.error "Cleanup#{application_label} finished with #{@failures.size} failed stage(s): #{@failures.map { |failure| failure[:stage] }.join(', ')}"
       end
 
       RailsPulse.logger.info "Cleanup completed:"

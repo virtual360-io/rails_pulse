@@ -948,7 +948,7 @@ module RailsPulse
 
       assert_raises(ActiveRecord::StatementTimeout) { CleanupService.perform }
 
-      assert_includes errors, "Cleanup stage queries (time_based) failed: ActiveRecord::StatementTimeout: canceling statement"
+      assert_includes errors, "Cleanup stage queries (time_based) failed after deleting 0 row(s): ActiveRecord::StatementTimeout: canceling statement"
       assert_includes errors, "Cleanup finished with 1 failed stage(s): queries (time_based)"
     end
 
