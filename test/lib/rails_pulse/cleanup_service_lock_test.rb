@@ -106,7 +106,12 @@ module RailsPulse
       seed_operations(summarized: 12, unsummarized: 1)
       RailsPulse.configuration.max_table_records = { rails_pulse_operations: 2 }
       limits = []
-      collect = ->(*, payload) { limits << payload[:type_casted_binds].last if payload[:sql].match?(/\ADELETE FROM "rails_pulse_operations"/) && !payload[:exception] }
+      collect = lambda do |*, payload|
+        next unless payload[:sql].match?(/\ADELETE FROM "rails_pulse_operations"/) && !payload[:exception]
+
+        binds = payload[:type_casted_binds]
+        limits << (binds.respond_to?(:call) ? binds.call : binds).last
+      end
 
       stats = nil
       ActiveSupport::Notifications.subscribed(collect, "sql.active_record") do
