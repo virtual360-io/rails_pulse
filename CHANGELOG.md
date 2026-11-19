@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Cleanup now waits out a locked database (SQLite's "database is locked" while ingestion or the summary job writes) with limited retries and smaller batches instead of failing the stage on the first busy batch; a run that still gives up on a lock records how far each stage got and is retried for that application half an hour later, up to three times.
 - A custom range ending exactly on an hour (or midnight) now treats that bound as exclusive, so a 15:00-to-15:00 selection charts 24 hourly buckets instead of 25 and the chart matches the displayed range (#337).
 - `rails generate rails_pulse:upgrade` now stamps copied migrations with a fresh timestamp instead of the gem's original one, so they run after the app's Rails Pulse install migration and `db:migrate` no longer fails on databases that have not run it yet (#420).
 - `rails_pulse:migrate_routes` no longer aborts when a recorded path isn't a valid URI (for example a scanner request like `/user[email]`); such routes count as skipped and the migration continues (#414).

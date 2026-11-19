@@ -4,6 +4,8 @@ module RailsPulse
   # Rails Pulse's jobs run once per application on a central, each in its
   # own database.
   class CentralJobsTest < CentralTestCase
+    include ActiveJob::TestHelper
+
     setup do
       @hour = 2.hours.ago.beginning_of_hour
       in_application(:alpha) { 3.times { record_request("/alpha", at: @hour + 5.minutes) } }
@@ -37,6 +39,48 @@ module RailsPulse
 
       in_application(:alpha) { assert_not RailsPulse::Summary.exists? }
       in_application(:beta) { assert_predicate RailsPulse::Summary, :exists? }
+    end
+
+    test "a cleanup follow-up for one application cleans that application's database only" do
+      in_application(:alpha) { record_request("/alpha-old", at: 60.days.ago) }
+      in_application(:beta) { record_request("/beta-old", at: 60.days.ago) }
+
+      RailsPulse::CleanupJob.perform_now(application: "beta", follow_up: 1)
+
+      in_application(:alpha) do
+        assert_equal 4, RailsPulse::Request.count
+        assert_not RailsPulse::CleanupRun.events.exists?
+      end
+      in_application(:beta) { assert_equal 1, RailsPulse::Request.count }
+    end
+
+    test "a cleanup that gives up on a lock in one application schedules a follow-up for it alone" do
+      original = RailsPulse::CleanupService.instance_method(:cleanup_operations_by_time)
+      RailsPulse::CleanupService.define_method(:cleanup_operations_by_time) do |cutoff|
+        raise ActiveRecord::StatementTimeout, "database is locked" if RailsPulse::Central.current_application == :alpha
+
+        original.bind_call(self, cutoff)
+      end
+
+      assert_raises(ActiveRecord::StatementTimeout) { RailsPulse::CleanupJob.perform_now }
+
+      follow_ups = enqueued_jobs.select { |job| job["job_class"] == "RailsPulse::CleanupJob" }
+
+      assert_equal 1, follow_ups.size
+      assert_equal "alpha", follow_ups.sole["arguments"].first["application"]
+      in_application(:alpha) do
+        assert_equal "alpha", RailsPulse::CleanupRun.latest.metadata_hash["application"]
+        assert_equal RailsPulse::CleanupRun.latest.id, follow_ups.sole["arguments"].first["after_run_id"]
+      end
+    ensure
+      RailsPulse::CleanupService.define_method(:cleanup_operations_by_time, original)
+    end
+
+    test "a follow-up for an application the central no longer lists does nothing" do
+      in_application(:alpha) { record_request("/alpha-old", at: 60.days.ago) }
+
+      assert_nil RailsPulse::CleanupJob.perform_now(application: "gone", follow_up: 1)
+      in_application(:alpha) { assert_equal 4, RailsPulse::Request.count }
     end
 
     # Edge Cases
