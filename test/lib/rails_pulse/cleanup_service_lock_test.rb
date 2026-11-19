@@ -65,7 +65,7 @@ module RailsPulse
       old_summary = create_overall_hourly_summary(period_end: 400.days.ago)
       RailsPulse.configuration.max_table_records = { rails_pulse_operations: 3 }
 
-      error = assert_raises(ActiveRecord::StatementTimeout) do
+      error = assert_lock_error do
         with_lock(after_deletes: 1, release_after_failures: attempts) { run_cleanup }
       end
 
@@ -82,7 +82,7 @@ module RailsPulse
       failure = run.metadata_hash["failures"].sole
 
       assert_equal "operations (count_based)", failure["stage"]
-      assert_equal "ActiveRecord::StatementTimeout", failure["error"]
+      assert_equal error.class.name, failure["error"]
       assert_equal 2, failure["deleted"]
       assert failure["lock_contention"]
       assert RailsPulse::CleanupRun.lock_contention_only?(run)
@@ -91,7 +91,7 @@ module RailsPulse
     test "the next run picks up where a failed one stopped and keeps unsummarized rows" do
       summarized, unsummarized = seed_operations(summarized: 7, unsummarized: 2)
       RailsPulse.configuration.max_table_records = { rails_pulse_operations: 3 }
-      assert_raises(ActiveRecord::StatementTimeout) do
+      assert_lock_error do
         with_lock(after_deletes: 1, release_after_failures: attempts) { run_cleanup }
       end
 
@@ -130,7 +130,7 @@ module RailsPulse
       summarized, unsummarized = seed_operations(summarized: 4, unsummarized: 1)
       RailsPulse.configuration.max_table_records = { rails_pulse_operations: 1 }
 
-      assert_raises(ActiveRecord::StatementTimeout) do
+      assert_lock_error do
         with_lock(after_deletes: 0, release_after_failures: attempts) { run_cleanup }
       end
 
@@ -138,7 +138,27 @@ module RailsPulse
       assert_equal 0, RailsPulse::CleanupRun.latest.metadata_hash["failures"].sole["deleted"]
     end
 
+    test "a statement error caused by SQLite's busy exception counts as a lock error, other statement errors do not" do
+      busy = wrapped_in_statement_invalid(SQLite3::BusyException.new("database is locked"))
+      other = wrapped_in_statement_invalid(SQLite3::SQLException.new("no such table: missing"))
+
+      assert_operator CleanupService::LockError, :===, busy
+      assert_operator CleanupService::LockError, :===, ActiveRecord::StatementTimeout.new("database is locked")
+      assert_not CleanupService::LockError === other
+      assert_not CleanupService::LockError === ActiveRecord::StatementInvalid.new("database is locked")
+    end
+
     private
+
+    def wrapped_in_statement_invalid(cause)
+      raise cause
+    rescue cause.class
+      begin
+        raise ActiveRecord::StatementInvalid, cause.message
+      rescue ActiveRecord::StatementInvalid => error
+        error
+      end
+    end
 
     # Loading the schema file defines RailsPulse::Schema and applies it to
     # RailsPulse::ApplicationRecord's connection, reporting what it creates on
@@ -153,6 +173,15 @@ module RailsPulse
       end
     ensure
       $stdout = stdout
+    end
+
+    # SQLite's "database is locked": a StatementTimeout from Active Record 8.0
+    # on, a StatementInvalid caused by SQLite3::BusyException before it.
+    def assert_lock_error(&block)
+      error = assert_raises(ActiveRecord::StatementInvalid, &block)
+
+      assert_operator CleanupService::LockError, :===, error
+      error
     end
 
     def attempts

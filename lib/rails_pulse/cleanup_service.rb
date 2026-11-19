@@ -35,6 +35,21 @@ module RailsPulse
       ActiveRecord::Deadlocked
     ].freeze
 
+    # Matches LOCK_ERRORS in a rescue clause, and also SQLite's "database is
+    # locked" where Active Record before 8.0 reports it as a plain
+    # StatementInvalid whose cause is the SQLite3::BusyException.
+    module LockError
+      def self.===(error)
+        LOCK_ERRORS.any? { |klass| error.is_a?(klass) } || sqlite_busy?(error)
+      end
+
+      def self.sqlite_busy?(error)
+        defined?(::SQLite3::BusyException) &&
+          error.is_a?(ActiveRecord::StatementInvalid) &&
+          error.cause.is_a?(::SQLite3::BusyException)
+      end
+    end
+
     # Attempts per statement, and the wait before each retry. With SQLite's
     # busy timeout on top, a statement gives up after a minute or so of
     # contention, and the stage then fails with what it had removed so far.
@@ -176,7 +191,7 @@ module RailsPulse
       attempt = 0
       begin
         yield
-      rescue *LOCK_ERRORS => e
+      rescue LockError => e
         delay = LOCK_RETRY_DELAYS[attempt]
         raise unless delay
 
@@ -194,7 +209,7 @@ module RailsPulse
     end
 
     def lock_error?(error)
-      LOCK_ERRORS.any? { |klass| error.is_a?(klass) }
+      LockError === error
     end
 
     def sqlite?
